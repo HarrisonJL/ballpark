@@ -1,0 +1,17 @@
+{
+  "name": "ballpark",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "tsx scripts/deploy.ts",
+    "check": "tsx scripts/check_state.ts"
+  },
+  "dependencies": {
+    "genlayer-js": "1.1.8"
+  },
+  "devDependencies": {
+    "dotenv": "^17",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
