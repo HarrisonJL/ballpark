@@ -73,8 +73,7 @@ Any other Intelligent Contract can call in via `gl.get_contract_at(BALLPARK_ADDR
 
 ## Deployment
 
-- **Address:** see `CONTRACT.md` (written after live deployment)
-- **Chain:** GenLayer Bradbury Testnet (chain id `4221`)
+See [`CONTRACT.md`](CONTRACT.md) for the live address, deploy tx, and deployer.
 
 ```bash
 npm install
