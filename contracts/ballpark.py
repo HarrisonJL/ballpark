@@ -10,7 +10,7 @@ import json
 
 MAX_CONTEXT_LEN = 6000
 MAX_METRICS = 10
-MAX_TOLERANCE_BPS = u32(10000)  # 100%
+MAX_TOLERANCE_BPS = u32(2000)  # 20% - a wider band stops meaning "agreement"
 
 
 def _now() -> datetime.datetime:
@@ -19,9 +19,8 @@ def _now() -> datetime.datetime:
 
 def _extract_values(context: str, metric_names: list[str]) -> str:
     # The only non-deterministic step. Every validator (leader included)
-    # runs this independently; agreement is decided in ask() below by
-    # _values_agree, not by exact string/JSON equality - see the module
-    # docstring-equivalent note there for why.
+    # runs this independently; agreement is decided in ask() below on the
+    # bucketed (see _bucket) result, not on this raw extraction directly.
     names_list = ", ".join(metric_names)
     prompt = f"""You are extracting specific numeric figures from a piece of text, for a
 system that checks whether independently-run extractions agree with each
@@ -52,41 +51,59 @@ figure that isn't actually supported by the text."""
     return json.dumps(out, sort_keys=True)
 
 
-def _within_tolerance(leader_value: int, mine_value: int, tolerance_bps: int) -> bool:
-    diff = abs(leader_value - mine_value)
-    if leader_value == 0:
-        # Relative tolerance is undefined at zero (any nonzero mine_value
-        # would be an infinite relative error). Fall back to an absolute
-        # band of tolerance_bps raw bps-scaled units instead of rejecting
-        # outright - still shrinks toward exact-match as tolerance_bps
-        # shrinks, just additively rather than multiplicatively.
-        return diff <= tolerance_bps
-    # diff / leader_value <= tolerance_bps / 10000, cross-multiplied to
-    # stay in integer arithmetic (GenVM calldata can't carry floats across
-    # a nondet boundary, and exact reproducible arithmetic is the point of
-    # an audit-able oracle regardless of where it runs).
-    return diff * 10000 <= tolerance_bps * leader_value
+# A naive "round to a size proportional to the value itself" bucket
+# self-cancels: bucket_size = value * t makes value // bucket_size a fixed
+# constant regardless of value's magnitude, so rounding just reconstructs
+# the original value (this was the actual bug behind the rejection - the
+# tolerance check compared raw values, but nothing ever coarsened what got
+# stored, so the leader's exact raw pick always became the output).
+# Genuine coarsening needs a magnitude-based step (how many significant
+# figures survive), which is a discrete function of digit count, not a
+# continuous fraction of the value.
+def _digit_count(value: int) -> int:
+    if value == 0:
+        return 1
+    count = 0
+    while value > 0:
+        value //= 10
+        count += 1
+    return count
 
 
-def _values_agree(leader_json: str, mine_json: str, tolerance_bps: int) -> bool:
-    try:
-        leader = json.loads(leader_json)
-        mine = json.loads(mine_json)
-    except (ValueError, TypeError):
-        return False
-    if not isinstance(leader, dict) or not isinstance(mine, dict):
-        return False
-    if leader.keys() != mine.keys():
-        return False
-    for key, leader_value in leader.items():
-        mine_value = mine[key]
-        if leader_value is None or mine_value is None:
-            if leader_value is not mine_value:
-                return False
-            continue
-        if not _within_tolerance(leader_value, mine_value, tolerance_bps):
-            return False
-    return True
+def _sig_figs_for_tolerance(tolerance_bps: int) -> int:
+    # Looser tolerance -> fewer significant figures kept in the canonical
+    # bucket, since consensus only actually verified agreement at that
+    # coarseness. tolerance_bps=0 is handled separately (exact, no
+    # bucketing at all).
+    if tolerance_bps <= 10:      # <= 0.1%
+        return 5
+    if tolerance_bps <= 100:     # <= 1%
+        return 4
+    if tolerance_bps <= 400:     # <= 4%
+        return 3
+    if tolerance_bps <= 1000:    # <= 10%
+        return 2
+    return 1                     # up to MAX_TOLERANCE_BPS (20%)
+
+
+def _bucket(value: int, tolerance_bps: int) -> int:
+    if tolerance_bps == 0 or value == 0:
+        return value
+    sig_figs = _sig_figs_for_tolerance(tolerance_bps)
+    digits = _digit_count(value)
+    if digits <= sig_figs:
+        return value
+    step = 10 ** (digits - sig_figs)
+    return ((value + step // 2) // step) * step  # round half up onto the grid
+
+
+def _extract_and_bucket(context: str, metric_names: list[str], tolerance_bps: int) -> str:
+    raw = json.loads(_extract_values(context, metric_names))
+    bucketed = {
+        name: (_bucket(value, tolerance_bps) if value is not None else None)
+        for name, value in raw.items()
+    }
+    return json.dumps(bucketed, sort_keys=True)
 
 
 @allow_storage
@@ -110,7 +127,7 @@ class Ballpark(gl.Contract):
         assert 1 <= len(context) <= MAX_CONTEXT_LEN, \
             f"context must be 1-{MAX_CONTEXT_LEN} chars"
         assert tolerance_bps <= MAX_TOLERANCE_BPS, \
-            f"tolerance_bps must be <= {MAX_TOLERANCE_BPS} (100%)"
+            f"tolerance_bps must be <= {MAX_TOLERANCE_BPS} (20%)"
 
         names: list[str] = []
         for m in metrics:
@@ -120,14 +137,24 @@ class Ballpark(gl.Contract):
         assert 1 <= len(names) <= MAX_METRICS, \
             f"must request 1-{MAX_METRICS} distinct, non-empty metric names"
 
+        # The stored result IS the canonical bucketed value, not either
+        # party's raw extraction - a validator agrees only by landing on
+        # the exact same bucket, so nothing ever gets recorded that a real
+        # majority didn't reproduce at that precision. This also closes the
+        # wide-tolerance case directly: even at MAX_TOLERANCE_BPS (1
+        # significant figure), a validator whose raw value has a different
+        # leading digit lands in a different bucket and disagrees - unlike
+        # comparing raw values, where a 100%-wide band let almost anything
+        # through while the leader's unmediated pick was still what got
+        # stored.
         def leader_fn() -> str:
-            return _extract_values(context, names)
+            return _extract_and_bucket(context, names, tolerance_bps)
 
         def validator_fn(leaders_res) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
                 return False
-            mine = _extract_values(context, names)
-            return _values_agree(leaders_res.calldata, mine, tolerance_bps)
+            mine = _extract_and_bucket(context, names, tolerance_bps)
+            return mine == leaders_res.calldata
 
         result_json = gl.vm.run_nondet(leader_fn, validator_fn)
 

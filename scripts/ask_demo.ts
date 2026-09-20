@@ -8,9 +8,12 @@ import { createClient, createAccount } from "genlayer-js";
 import { testnetBradbury } from "genlayer-js/chains";
 import "dotenv/config";
 
+// Deliberately not round numbers, so the demo visibly shows the fix: the
+// stored result should come back as a rounded canonical bucket (e.g. 1.437
+// -> 1.4), not the model's exact raw extraction.
 const CONTEXT =
-  "In Q1 2026, Acme Robotics reported revenue of $4.2 million and closed " +
-  "the quarter with a headcount of 120 full-time employees.";
+  "In Q1 2026, Acme Robotics reported a debt service coverage ratio of " +
+  "1.437x and closed the quarter with a headcount of 118 full-time employees.";
 
 async function main() {
   const address = process.argv[2];
@@ -32,7 +35,7 @@ async function main() {
   const txHash = await client.writeContract({
     address: address as `0x${string}`,
     functionName: "ask",
-    args: [CONTEXT, ["revenue_millions", "headcount"], 500],
+    args: [CONTEXT, ["dscr", "headcount"], 500],
     value: 0n,
   });
   console.log(`Submitted ${txHash} - waiting for finality (this can take a while on Bradbury)...`);
