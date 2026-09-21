@@ -22,6 +22,33 @@ Fired a real `ask()` call ([`scripts/ask_demo.ts`](scripts/ask_demo.ts)) against
 
 `query_count` moved 0 -> 1 in the same call.
 
+## CovenantCheck (composability demo)
+
+- **Address:** [`0xC846a4e0fcE8e8223CB06eee138161B09f2bea8A`](https://explorer-bradbury.genlayer.com/address/0xC846a4e0fcE8e8223CB06eee138161B09f2bea8A)
+- **Deploy tx:** [`0xe337c779ec5097506f5dc1aea016e28a37110dd73daec9573802cdcb8ebb6e75`](https://explorer-bradbury.genlayer.com/tx/0xe337c779ec5097506f5dc1aea016e28a37110dd73daec9573802cdcb8ebb6e75)
+- **Points at Ballpark:** `0x2d061E63d10EcC6aeeB9f82d232fAEA9F932e6DA` (the current deployment above)
+
+### Live proof the cross-contract call actually works
+
+Three covenants added, two deliberately passable and one deliberately set to fail - so a clean pass wouldn't just mean "the checker rubber-stamps everything":
+
+- `min_dscr`: `dscr >= 1.25` (tx [`0xa13e0f25...`](https://explorer-bradbury.genlayer.com/tx/0xa13e0f25a405fbb1cf64e428d8e958926533a8dd80113b435d38f982df5be415))
+- `min_headcount`: `headcount >= 100` (tx [`0x98b1da15...`](https://explorer-bradbury.genlayer.com/tx/0x98b1da15fb26c3b4cfc8501be2e5a59cb548b97cf020b494b78b5c581e41ed2a))
+- `min_dscr_strict`: `dscr >= 2.0` (tx [`0x58372061...`](https://explorer-bradbury.genlayer.com/tx/0x583720610a75bd2d758ada6c28f4f5a586ba8653b2055ab757de193f3efd0c21)) - deliberately fails, since query 0's dscr is 1.4
+
+Then `check_against_ballpark_query(0)` - tx [`0x7edbc62b...`](https://explorer-bradbury.genlayer.com/tx/0x7edbc62b4a1a00ebb2c957db346c34fac5bdf49e796229aef8f688bee8e3a95a), `FINISHED_WITH_RETURN`:
+
+```json
+{
+  "all_passed": false,
+  "ballpark_query_id": 0,
+  "details_json": "{\"min_dscr\": \"pass\", \"min_dscr_strict\": \"fail\", \"min_headcount\": \"pass\"}",
+  "requester": "0x5cdb5699bc1038e115A973bb91A646f7E98C075b"
+}
+```
+
+This is a real transaction where `CovenantCheck` made a real synchronous cross-contract view call into `Ballpark`'s already-committed state, parsed the result, and correctly evaluated all three covenants - two passing, one deliberately failing, exactly as designed. Not simulated, and not something Direct Mode could even test locally (see the main README's "Testing" section).
+
 ## Superseded
 
 [`0xDaBa7fd00049a5C95C0Fd1647B85e888A20d8214`](https://explorer-bradbury.genlayer.com/address/0xDaBa7fd00049a5C95C0Fd1647B85e888A20d8214) - the version that stored the leader's raw extraction directly, correctly rejected by steward review. Left live and linked here rather than hidden, as the actual before/after for the fix described in the README.

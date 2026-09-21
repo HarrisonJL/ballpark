@@ -66,16 +66,29 @@ Bradbury runs GenVM **v0.2.11** - confirmed against the real SDK build extracted
 1. **Integration tests** - real `ask()` calls with a mocked LLM: state bookkeeping, input validation, metric-name deduplication, null-handling for ungrounded extractions, and - directly targeting the rejected version's defect - a parametrized sweep proving the *stored* `result_json` is the bucketed value at every significant-figure threshold, never the model's raw extraction.
 2. **Consensus-boundary tests** - via gltest's `direct_vm.run_validator(leader_result=...)` cheatcode. Direct Mode runs `leader_fn` directly and only *captures* `validator_fn` for later inspection (it doesn't simulate a real multi-validator vote in-process), so mocking the LLM alone can't exercise disagreement - both "sides" would hit the same canned response and trivially agree. `run_validator` re-invokes the real, captured `validator_fn` closure with an explicit hypothetical leader result, which is the documented, intended way to test this - not a workaround. This is what exercises the bucket-agreement logic itself: same-bucket agreement despite non-identical raw values, boundary-straddling disagreement, null-vs-value mismatches, partial-vector disagreement, and - explicitly - `test_max_tolerance_no_longer_lets_zero_and_one_agree`, which reproduces the exact scenario the steward rejection named and confirms it's closed.
 
+`tests/test_covenant_check.py` (6 tests) covers everything Direct Mode genuinely can verify for the composability contract - access control, covenant bookkeeping, comparison validation, and the precondition that must fail *before* ever reaching the cross-contract call. The cross-contract read itself is structurally untestable in Direct Mode (see "Composability") and is instead verified live on Bradbury - see `CONTRACT.md`.
+
 ```bash
 python3.14 -m venv .venv && source .venv/bin/activate
 pip install "genlayer-test[sim]==0.29.2" genvm-linter==0.11.0
 genvm-lint check contracts/ballpark.py
+genvm-lint check contracts/covenant_check.py
 pytest tests/ -v
 ```
 
 ## Composability
 
-Any other Intelligent Contract can call in via `gl.get_contract_at(BALLPARK_ADDRESS).ask(context, metrics, tolerance_bps)` and read the result back with `get_query`/`get_queries` - no special integration, just a cross-contract call. Covenant Sentinel's own `_extract_metrics` (in the sibling `covenant-sentinel` repo) is a direct precedent for what this generalizes: it does its own inline extraction via `strict_eq`, accepting the byte-exact-match fragility described above. Ballpark is the reusable version of that same underlying need, decoupled from any one contract's domain logic.
+`contracts/covenant_check.py` is a second, deployed contract that actually consumes Ballpark - not just a README claim. It's the disclosure-checking half of Covenant Sentinel's own logic (in the sibling `covenant-sentinel` repo), rebuilt to read an already-agreed Ballpark result instead of duplicating its own `strict_eq`-based extraction:
+
+```python
+query = gl.get_contract_at(self.ballpark_address).view().get_query(ballpark_query_id)
+values = json.loads(query["result_json"])
+# ... compare each covenant's metric against its threshold, deterministically
+```
+
+**Why a view call, not a write call to `ask()` directly.** GenVM v0.2.11 has no synchronous way to call another contract's write method and use its return value in the same transaction - confirmed by reading `genlayer/gl/genvm_contracts.py` directly: `gl.get_contract_at(...).emit(...)` sends a fire-and-forget `PostMessage` (`__call__(...) -> None`), not a call-and-wait. A synchronous `.view()` call is the only cross-contract path that returns a real value inline, which is also the *correct* fit here: Ballpark's committee already reached consensus on the number once, so a second contract reading that settled record deterministically is right - re-running the extraction from inside `CovenantCheck` would just duplicate work and reintroduce the exact byte-exact-match fragility Ballpark exists to avoid. This also means cross-contract calls are only usable outside a `run_nondet`/`eq_principle` block (GenVM raises `SystemError: 6` if attempted inside one - also confirmed directly, not assumed) - not a constraint that affects this design, since `check_against_ballpark_query` never touches an LLM itself.
+
+See [`CONTRACT.md`](CONTRACT.md) for the live `CovenantCheck` address and a real transaction reading a real Ballpark query cross-contract - not simulated, and (see "Testing") not something Direct Mode can even exercise, since it has no local routing for cross-contract calls without GLSim.
 
 ## Deployment
 
@@ -86,6 +99,10 @@ npm install
 # DEPLOYER_PRIVATE_KEY in .env (gitignored, never commit a private key)
 npm run deploy
 npx tsx scripts/ask_demo.ts <contract_address>
+
+# CovenantCheck (composability demo) - defaults to the live Ballpark address
+npx tsx scripts/deploy_covenant_check.ts
+npx tsx scripts/covenant_check_demo.ts <covenant_check_address> <ballpark_query_id>
 ```
 
 ## Known limitations
