@@ -4,20 +4,22 @@ Deterministic tests for Ballpark using genlayer-test's Direct Mode.
 Two layers, matching how the contract's own logic is layered:
 
 1. Integration tests (via direct_deploy + real ask() calls, LLM mocked):
-   the happy path, input validation, state bookkeeping, and - critically -
-   that the STORED result is the canonical bucketed value, not either
-   party's raw extraction (this is the exact defect a steward review
-   found: the leader's raw pick was becoming the oracle output regardless
-   of how loose the tolerance was).
+   the happy path, input validation, state bookkeeping, and - directly
+   targeting a rejected earlier revision's defect - proof that the stored
+   result is the raw, verified extraction, not a further-rounded figure
+   that no longer matches what tolerance_bps actually verified.
 2. Consensus-boundary tests (via direct_vm.run_validator): Direct Mode
    runs leader_fn directly and only *captures* validator_fn for later
    inspection (real per-validator voting isn't simulated in-process), so
-   the bucketing/agreement logic can't be exercised by mocking the LLM
-   alone - both leader and a re-run validator would hit the same canned
-   response and trivially "agree". run_validator() re-invokes the REAL
-   captured validator_fn with an explicit leader_result, which is the
-   documented, supported way to test this - not a workaround, the actual
-   intended use of the cheatcode.
+   the tolerance math itself can't be exercised by mocking the LLM alone -
+   both leader and a re-run validator would hit the same canned response
+   and trivially "agree". run_validator() re-invokes the REAL captured
+   validator_fn with an explicit leader_result, which is the documented,
+   supported way to test this - not a workaround. These are exact,
+   deterministic boundary tests (agrees at exactly tolerance_bps, fails
+   one unit past it) - the earlier significant-figure-rounding revision
+   could never support tests this precise, since its effective tolerance
+   varied depending on where a value fell within its own digit range.
 """
 
 import json
@@ -104,23 +106,21 @@ def test_get_queries_paginates_newest_first(direct_vm, direct_deploy, direct_own
     assert [json.loads(q["result_json"])["revenue"] for q in recent] == [2, 1]
 
 
-def test_stored_result_is_the_canonical_bucket_not_the_raw_leader_pick(
-    direct_vm, direct_deploy, direct_owner
-):
-    # This is the exact defect a steward review found: the contract used
-    # to store whatever the leader's raw extraction happened to be,
-    # unmediated by the tolerance that was supposedly verified. Now the
-    # stored value is the bucketed figure - a real, ugly raw extraction
-    # like 15437 must come back rounded to the precision the requested
-    # tolerance actually implies (500 bps -> 2 significant figures here),
-    # not as 15437 itself.
+def test_stored_result_is_the_raw_verified_value(direct_vm, direct_deploy, direct_owner):
+    # An earlier revision of this contract rounded the stored value to a
+    # number of significant figures - which a steward review correctly
+    # flagged as not actually reflecting tolerance_bps (see _within_tolerance's
+    # docstring). The stored value is now the leader's raw extraction,
+    # exactly as the model returned it - the guarantee that it's within
+    # tolerance_bps of every agreeing validator's own extraction lives in
+    # the comparison (tested below), not in further-rounding the output.
     bp = _deploy(direct_vm, direct_deploy, direct_owner)
     _mock(direct_vm, {"dscr": 15437})
 
     bp.ask(CTX, ["dscr"], 500)
 
     result = json.loads(bp.get_query(0)["result_json"])
-    assert result == {"dscr": 15000}
+    assert result == {"dscr": 15437}
 
 
 # --- Integration: input validation ------------------------------------------
@@ -151,46 +151,57 @@ def test_ask_rejects_tolerance_over_20_percent(direct_vm, direct_deploy, direct_
 
 
 # --- Consensus boundary: the real validator_fn, via run_validator ----------
+# Exact, deterministic boundary tests: leader=10000 (an arbitrary round
+# base), tolerance_bps=500 (5%) implies an agreement radius of exactly
+# diff <= 500 raw units - verified precisely at, and one unit past, that
+# boundary.
 
 
-def test_validator_agrees_when_raw_values_round_to_the_same_bucket(
-    direct_vm, direct_deploy, direct_owner
-):
-    # 15000 and 15499 are not byte-identical, but at 500 bps (2 sig figs)
-    # they round to the same bucket (15000) - this is the actual point of
-    # a tolerance oracle: "close enough" counts, without the stored output
-    # ever claiming more precision than was really verified.
+def test_validator_agrees_within_tolerance(direct_vm, direct_deploy, direct_owner):
     bp = _deploy(direct_vm, direct_deploy, direct_owner)
-    _mock(direct_vm, {"dscr": 15000})
+    _mock(direct_vm, {"dscr": 10000})
     bp.ask(CTX, ["dscr"], 500)
 
     direct_vm.clear_mocks()
-    _mock(direct_vm, {"dscr": 15499})
-    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 15000}))
+    _mock(direct_vm, {"dscr": 10200})  # 2% off - well inside 5%
+    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 10000}))
     assert agree is True
 
 
-def test_validator_disagrees_across_a_bucket_boundary(direct_vm, direct_deploy, direct_owner):
-    # 15499 and 15500 differ by a single raw unit (a rounding difference
-    # nobody would call "material"), but they straddle the 2-sig-fig grid
-    # line (15000 vs 16000) and so land in different buckets. This is a
-    # known, accepted property of any bucketed/quantized agreement scheme
-    # (the same thing happens rounding a clock to the nearest minute) -
-    # documented here deliberately, not treated as a bug.
+def test_validator_agrees_at_exact_tolerance_boundary(direct_vm, direct_deploy, direct_owner):
     bp = _deploy(direct_vm, direct_deploy, direct_owner)
-    _mock(direct_vm, {"dscr": 15499})
+    _mock(direct_vm, {"dscr": 10000})
     bp.ask(CTX, ["dscr"], 500)
 
     direct_vm.clear_mocks()
-    _mock(direct_vm, {"dscr": 15500})
-    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 15000}))
+    _mock(direct_vm, {"dscr": 10500})  # exactly 5% off - "<=", not "<"
+    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 10000}))
+    assert agree is True
+
+
+def test_validator_disagrees_one_unit_past_boundary(direct_vm, direct_deploy, direct_owner):
+    bp = _deploy(direct_vm, direct_deploy, direct_owner)
+    _mock(direct_vm, {"dscr": 10000})
+    bp.ask(CTX, ["dscr"], 500)
+
+    direct_vm.clear_mocks()
+    _mock(direct_vm, {"dscr": 10501})  # one raw unit past the boundary
+    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 10000}))
     assert agree is False
 
 
-def test_validator_zero_tolerance_requires_exact_raw_match(direct_vm, direct_deploy, direct_owner):
-    # tolerance_bps=0 skips bucketing entirely (the bucket of a value at
-    # zero tolerance is the value itself), so it subsumes strict equality
-    # as a special case.
+def test_validator_disagrees_well_outside_tolerance(direct_vm, direct_deploy, direct_owner):
+    bp = _deploy(direct_vm, direct_deploy, direct_owner)
+    _mock(direct_vm, {"dscr": 10000})
+    bp.ask(CTX, ["dscr"], 500)
+
+    direct_vm.clear_mocks()
+    _mock(direct_vm, {"dscr": 12000})  # 20% off
+    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 10000}))
+    assert agree is False
+
+
+def test_validator_zero_tolerance_requires_exact_match(direct_vm, direct_deploy, direct_owner):
     bp = _deploy(direct_vm, direct_deploy, direct_owner)
     _mock(direct_vm, {"dscr": 15000})
     bp.ask(CTX, ["dscr"], 0)
@@ -212,18 +223,21 @@ def test_validator_zero_tolerance_agrees_on_exact_match(direct_vm, direct_deploy
     assert agree is True
 
 
-def test_validator_small_values_are_never_bucketed(direct_vm, direct_deploy, direct_owner):
-    # Values with fewer digits than the tolerance's significant-figure
-    # count pass through _bucket unchanged - there's no free pass for
-    # small numbers just because they're short.
+def test_validator_leader_zero_uses_absolute_band(direct_vm, direct_deploy, direct_owner):
+    # Relative tolerance is undefined at leader_value == 0 (division by
+    # zero) - the contract falls back to an absolute band of
+    # tolerance_bps raw units instead.
     bp = _deploy(direct_vm, direct_deploy, direct_owner)
-    _mock(direct_vm, {"dscr": 4})
-    bp.ask(CTX, ["dscr"], 500)
+    _mock(direct_vm, {"dscr": 0})
+    bp.ask(CTX, ["dscr"], 100)
 
     direct_vm.clear_mocks()
-    _mock(direct_vm, {"dscr": 5})
-    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 4}))
-    assert agree is False
+    _mock(direct_vm, {"dscr": 100})
+    assert direct_vm.run_validator(leader_result=json.dumps({"dscr": 0})) is True
+
+    direct_vm.clear_mocks()
+    _mock(direct_vm, {"dscr": 101})
+    assert direct_vm.run_validator(leader_result=json.dumps({"dscr": 0})) is False
 
 
 def test_validator_disagrees_when_only_one_side_has_null(direct_vm, direct_deploy, direct_owner):
@@ -265,79 +279,39 @@ def test_validator_requires_all_metrics_to_agree(direct_vm, direct_deploy, direc
     assert agree is False
 
 
-# --- The specific case a steward review flagged: max tolerance was too weak -
+# --- The specific case a steward review flagged: significant-figure -------
+# rounding let a 50% difference "agree" at MAX_TOLERANCE_BPS (20%). These
+# reproduce that exact scenario against the corrected comparison.
 
 
-def test_max_tolerance_no_longer_lets_zero_and_one_agree(direct_vm, direct_deploy, direct_owner):
-    # The rejected version compared raw values with a relative-tolerance
-    # check and a zero special-case that degenerated at MAX tolerance:
-    # leader=0 and a validator reporting 1 both "validated". Bucketing
-    # closes this outright - bucket(0, *) is always 0, and 1 has fewer
-    # digits than any sig-fig count so it's never rounded down to 0.
+def test_max_tolerance_rejects_the_reported_fifty_percent_case(direct_vm, direct_deploy, direct_owner):
     bp = _deploy(direct_vm, direct_deploy, direct_owner)
-    _mock(direct_vm, {"dscr": 0})
-    bp.ask(CTX, ["dscr"], 2000)  # MAX_TOLERANCE_BPS
+    _mock(direct_vm, {"dscr": 10000})
+    bp.ask(CTX, ["dscr"], 2000)  # 20% = MAX_TOLERANCE_BPS
 
     direct_vm.clear_mocks()
-    _mock(direct_vm, {"dscr": 1})
-    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 0}))
+    _mock(direct_vm, {"dscr": 14999})  # ~50% off - the old bucketing bug let this "agree"
+    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 10000}))
     assert agree is False
 
 
-def test_max_tolerance_still_rejects_different_orders_of_magnitude(
-    direct_vm, direct_deploy, direct_owner
-):
+def test_max_tolerance_agrees_at_exact_20_percent_boundary(direct_vm, direct_deploy, direct_owner):
     bp = _deploy(direct_vm, direct_deploy, direct_owner)
-    _mock(direct_vm, {"dscr": 50000})
+    _mock(direct_vm, {"dscr": 10000})
     bp.ask(CTX, ["dscr"], 2000)
 
     direct_vm.clear_mocks()
-    _mock(direct_vm, {"dscr": 15000})  # a little over 3x smaller
-    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 50000}))
-    assert agree is False
-
-
-def test_max_tolerance_still_agrees_on_genuinely_close_values(
-    direct_vm, direct_deploy, direct_owner
-):
-    # Even at the loosest allowed tolerance (1 significant figure), values
-    # within ~10% of each other that round to the same leading digit
-    # still agree - the band isn't so loose it rejects everything either.
-    # Leader's raw 52000 buckets to 50000 (what leader_fn actually
-    # returns) - that bucketed value, not the raw 52000, is what a real
-    # leader_result would be.
-    bp = _deploy(direct_vm, direct_deploy, direct_owner)
-    _mock(direct_vm, {"dscr": 52000})
-    bp.ask(CTX, ["dscr"], 2000)
-
-    direct_vm.clear_mocks()
-    _mock(direct_vm, {"dscr": 48000})
-    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 50000}))
+    _mock(direct_vm, {"dscr": 12000})  # exactly 20% off
+    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 10000}))
     assert agree is True
 
 
-# --- Pure bucketing thresholds, exercised through the public write path ----
-
-
-@pytest.mark.parametrize(
-    "raw,tolerance_bps,expected",
-    [
-        (15437, 0, 15437),       # exact: no bucketing at all
-        (15437, 10, 15437),      # <=0.1% -> 5 sig figs, 5-digit value unchanged
-        (154370, 10, 154370),    # 6-digit value, 5 sig figs -> rounds to 10s
-        (15437, 100, 15440),     # <=1% -> 4 sig figs
-        (15437, 400, 15400),     # <=4% -> 3 sig figs
-        (15437, 401, 15000),     # >4% -> 2 sig figs
-        (15437, 1000, 15000),    # <=10% -> 2 sig figs
-        (15437, 1001, 20000),    # >10% -> 1 sig fig
-        (15437, 2000, 20000),    # MAX_TOLERANCE_BPS -> 1 sig fig
-    ],
-)
-def test_bucket_thresholds_via_stored_result(
-    direct_vm, direct_deploy, direct_owner, raw, tolerance_bps, expected
-):
+def test_max_tolerance_disagrees_one_unit_past_20_percent(direct_vm, direct_deploy, direct_owner):
     bp = _deploy(direct_vm, direct_deploy, direct_owner)
-    _mock(direct_vm, {"x": raw})
-    bp.ask(CTX, ["x"], tolerance_bps)
-    result = json.loads(bp.get_query(0)["result_json"])
-    assert result == {"x": expected}
+    _mock(direct_vm, {"dscr": 10000})
+    bp.ask(CTX, ["dscr"], 2000)
+
+    direct_vm.clear_mocks()
+    _mock(direct_vm, {"dscr": 12001})
+    agree = direct_vm.run_validator(leader_result=json.dumps({"dscr": 10000}))
+    assert agree is False

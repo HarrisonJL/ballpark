@@ -19,8 +19,9 @@ def _now() -> datetime.datetime:
 
 def _extract_values(context: str, metric_names: list[str]) -> str:
     # The only non-deterministic step. Every validator (leader included)
-    # runs this independently; agreement is decided in ask() below on the
-    # bucketed (see _bucket) result, not on this raw extraction directly.
+    # runs this independently; agreement is decided in ask() below by
+    # _values_agree, a precise relative-tolerance check on these raw
+    # numbers - not by exact string/JSON equality.
     names_list = ", ".join(metric_names)
     prompt = f"""You are extracting specific numeric figures from a piece of text, for a
 system that checks whether independently-run extractions agree with each
@@ -51,59 +52,56 @@ figure that isn't actually supported by the text."""
     return json.dumps(out, sort_keys=True)
 
 
-# A naive "round to a size proportional to the value itself" bucket
-# self-cancels: bucket_size = value * t makes value // bucket_size a fixed
-# constant regardless of value's magnitude, so rounding just reconstructs
-# the original value (this was the actual bug behind the rejection - the
-# tolerance check compared raw values, but nothing ever coarsened what got
-# stored, so the leader's exact raw pick always became the output).
-# Genuine coarsening needs a magnitude-based step (how many significant
-# figures survive), which is a discrete function of digit count, not a
-# continuous fraction of the value.
-def _digit_count(value: int) -> int:
-    if value == 0:
-        return 1
-    count = 0
-    while value > 0:
-        value //= 10
-        count += 1
-    return count
+# Earlier revision of this contract rounded values to a number of
+# significant figures derived from tolerance_bps, then compared the
+# rounded figures for exact equality. A steward review correctly caught
+# that this doesn't actually enforce the tolerance the caller selected:
+# rounding to N significant figures allows a relative error that swings
+# wildly depending on where a value sits within its own digit range - at
+# MAX_TOLERANCE_BPS (mapped to 1 significant figure), a leader value of
+# 10000 and a validator value of 14999 (a 50% difference) both round to
+# the same bucket and "agree", despite the caller having selected 20%.
+# That's a real inconsistency, not a rare edge case - it's the norm near
+# the bottom of any digit range. Comparing raw values against a precise,
+# uniform relative-tolerance formula is the only way tolerance_bps means
+# what it says at every value and at every requested tolerance.
+def _within_tolerance(leader_value: int, mine_value: int, tolerance_bps: int) -> bool:
+    diff = abs(leader_value - mine_value)
+    if leader_value == 0:
+        # Relative tolerance is undefined at zero (any nonzero mine_value
+        # is an infinite relative error). Fall back to a small absolute
+        # band of tolerance_bps raw bps-scaled units - with
+        # MAX_TOLERANCE_BPS capped at 2000, that's at most +/-0.2 in real
+        # units, not the degenerate case a much higher cap once allowed.
+        return diff <= tolerance_bps
+    # diff / leader_value <= tolerance_bps / 10000, cross-multiplied to
+    # stay in integer arithmetic (GenVM calldata can't carry floats across
+    # a nondet boundary, and exact reproducible arithmetic is the point of
+    # an audit-able oracle regardless of where it runs). This is exact -
+    # no digit-count-dependent approximation, so tolerance_bps means the
+    # same relative bound for every value, at every requested tolerance.
+    return diff * 10000 <= tolerance_bps * leader_value
 
 
-def _sig_figs_for_tolerance(tolerance_bps: int) -> int:
-    # Looser tolerance -> fewer significant figures kept in the canonical
-    # bucket, since consensus only actually verified agreement at that
-    # coarseness. tolerance_bps=0 is handled separately (exact, no
-    # bucketing at all).
-    if tolerance_bps <= 10:      # <= 0.1%
-        return 5
-    if tolerance_bps <= 100:     # <= 1%
-        return 4
-    if tolerance_bps <= 400:     # <= 4%
-        return 3
-    if tolerance_bps <= 1000:    # <= 10%
-        return 2
-    return 1                     # up to MAX_TOLERANCE_BPS (20%)
-
-
-def _bucket(value: int, tolerance_bps: int) -> int:
-    if tolerance_bps == 0 or value == 0:
-        return value
-    sig_figs = _sig_figs_for_tolerance(tolerance_bps)
-    digits = _digit_count(value)
-    if digits <= sig_figs:
-        return value
-    step = 10 ** (digits - sig_figs)
-    return ((value + step // 2) // step) * step  # round half up onto the grid
-
-
-def _extract_and_bucket(context: str, metric_names: list[str], tolerance_bps: int) -> str:
-    raw = json.loads(_extract_values(context, metric_names))
-    bucketed = {
-        name: (_bucket(value, tolerance_bps) if value is not None else None)
-        for name, value in raw.items()
-    }
-    return json.dumps(bucketed, sort_keys=True)
+def _values_agree(leader_json: str, mine_json: str, tolerance_bps: int) -> bool:
+    try:
+        leader = json.loads(leader_json)
+        mine = json.loads(mine_json)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(leader, dict) or not isinstance(mine, dict):
+        return False
+    if leader.keys() != mine.keys():
+        return False
+    for key, leader_value in leader.items():
+        mine_value = mine[key]
+        if leader_value is None or mine_value is None:
+            if leader_value is not mine_value:
+                return False
+            continue
+        if not _within_tolerance(leader_value, mine_value, tolerance_bps):
+            return False
+    return True
 
 
 @allow_storage
@@ -137,24 +135,23 @@ class Ballpark(gl.Contract):
         assert 1 <= len(names) <= MAX_METRICS, \
             f"must request 1-{MAX_METRICS} distinct, non-empty metric names"
 
-        # The stored result IS the canonical bucketed value, not either
-        # party's raw extraction - a validator agrees only by landing on
-        # the exact same bucket, so nothing ever gets recorded that a real
-        # majority didn't reproduce at that precision. This also closes the
-        # wide-tolerance case directly: even at MAX_TOLERANCE_BPS (1
-        # significant figure), a validator whose raw value has a different
-        # leading digit lands in a different bucket and disagrees - unlike
-        # comparing raw values, where a 100%-wide band let almost anything
-        # through while the leader's unmediated pick was still what got
-        # stored.
+        # The stored result is the leader's raw extraction - but unlike
+        # the earlier, rejected version, that's now safe: _within_tolerance
+        # gives an exact, uniform bound (see its docstring), so "every
+        # validator-compatible value is within tolerance_bps of the stored
+        # figure" is a strict mathematical guarantee, not an approximation
+        # that can drift depending on the value's magnitude. tolerance_bps
+        # is stored alongside result_json (below) precisely so that
+        # guarantee is always explicit and checkable by any reader or
+        # consumer, rather than a hidden property of a rounded number.
         def leader_fn() -> str:
-            return _extract_and_bucket(context, names, tolerance_bps)
+            return _extract_values(context, names)
 
         def validator_fn(leaders_res) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
                 return False
-            mine = _extract_and_bucket(context, names, tolerance_bps)
-            return mine == leaders_res.calldata
+            mine = _extract_values(context, names)
+            return _values_agree(leaders_res.calldata, mine, tolerance_bps)
 
         result_json = gl.vm.run_nondet(leader_fn, validator_fn)
 
