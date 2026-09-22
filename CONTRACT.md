@@ -2,41 +2,41 @@
 
 ## Current
 
-- **Address:** [`0x2d061E63d10EcC6aeeB9f82d232fAEA9F932e6DA`](https://explorer-bradbury.genlayer.com/address/0x2d061E63d10EcC6aeeB9f82d232fAEA9F932e6DA)
+- **Address:** [`0xCbE5B73E8905062673EeD89e1C1EC9FBD2C63469`](https://explorer-bradbury.genlayer.com/address/0xCbE5B73E8905062673EeD89e1C1EC9FBD2C63469)
 - **Network:** GenLayer Bradbury Testnet (chain id `4221`)
-- **Deploy tx:** [`0xbefea4995e72ae4f67bd2997cf1356c70abe1b46fb4ee2987b238e033822fa41`](https://explorer-bradbury.genlayer.com/tx/0xbefea4995e72ae4f67bd2997cf1356c70abe1b46fb4ee2987b238e033822fa41)
+- **Deploy tx:** [`0xd33979e9c6dd4af749475bb344edd9d9a1c473e9528410558ac3d64b72eace22`](https://explorer-bradbury.genlayer.com/tx/0xd33979e9c6dd4af749475bb344edd9d9a1c473e9528410558ac3d64b72eace22)
 - **Deployer:** `0x5cdb5699bc1038e115A973bb91A646f7E98C075b`
 
-This is the version with the bucketing fix (see README's "Design note" in "How it works") - the leader's raw extraction is never what gets stored; a rounded, canonical value both parties independently reproduce is.
+This is the version with the corrected tolerance enforcement (see README's "Design note" in "How it works") - agreement is a precise, uniform relative-tolerance check on raw values, not an approximate significant-figure rounding. The stored result is the leader's raw extraction; `tolerance_bps` stored alongside it is the actual, exact bound.
 
 Confirmed genuinely readable post-deploy via a real `get_state()` call (not just a "finalized" receipt status).
 
-### Live proof the fix actually changes what's stored
+### Live proof the fix actually enforces the selected tolerance
 
-Fired a real `ask()` call ([`scripts/ask_demo.ts`](scripts/ask_demo.ts)) against the live committee - no mocked LLM, no Direct Mode - with deliberately non-round source values so the fix would be visible in the result, not just asserted:
+Fired a real `ask()` call ([`scripts/ask_demo.ts`](scripts/ask_demo.ts)) against the live committee - no mocked LLM, no Direct Mode - with the same deliberately non-round source values used before, so the before/after is directly comparable:
 
 - **Context:** "...reported a debt service coverage ratio of 1.437x and closed the quarter with a headcount of 118 full-time employees."
-- **Requested:** `["dscr", "headcount"]`, `tolerance_bps: 500` (5%, 2 significant figures)
-- **Tx:** [`0x68eb4c33e5bfcb128873e9f8085ce4cf5a3582601d75dd4932c336e5ccefc467`](https://explorer-bradbury.genlayer.com/tx/0x68eb4c33e5bfcb128873e9f8085ce4cf5a3582601d75dd4932c336e5ccefc467) - `FINISHED_WITH_RETURN`
-- **Stored result:** `{"dscr": 14000, "headcount": 1200000}` - i.e. **1.4x and 120**, not the raw 1.437x and 118 the text actually states. The independent validator committee's own extractions rounded onto the same canonical bucket as the leader's and agreed on *that*, and that rounded figure - not either party's raw pick - is what landed on-chain.
+- **Requested:** `["dscr", "headcount"]`, `tolerance_bps: 500` (5%)
+- **Tx:** [`0x5f551b0a37eea24a20cd291b89c79344f9b895ab88fca50233a63c10f9825c51`](https://explorer-bradbury.genlayer.com/tx/0x5f551b0a37eea24a20cd291b89c79344f9b895ab88fca50233a63c10f9825c51) - `FINISHED_WITH_RETURN`
+- **Stored result:** `{"dscr": 14370, "headcount": 1180000}` - i.e. **1.437x and 118**, the exact raw extraction, not a rounded 1.4x/120 as the previous (rejected) deployment stored. The independent validator committee's own extractions were each within 5% of this raw figure - that bound is real and exact now, not an approximation that could drift as far as 50% at the loosest setting like the previous version's did.
 
 `query_count` moved 0 -> 1 in the same call.
 
 ## CovenantCheck (composability demo)
 
-- **Address:** [`0xC846a4e0fcE8e8223CB06eee138161B09f2bea8A`](https://explorer-bradbury.genlayer.com/address/0xC846a4e0fcE8e8223CB06eee138161B09f2bea8A)
-- **Deploy tx:** [`0xe337c779ec5097506f5dc1aea016e28a37110dd73daec9573802cdcb8ebb6e75`](https://explorer-bradbury.genlayer.com/tx/0xe337c779ec5097506f5dc1aea016e28a37110dd73daec9573802cdcb8ebb6e75)
-- **Points at Ballpark:** `0x2d061E63d10EcC6aeeB9f82d232fAEA9F932e6DA` (the current deployment above)
+- **Address:** [`0x599fFD68BAF46De02C381Ed0F14D181f4495c1A7`](https://explorer-bradbury.genlayer.com/address/0x599fFD68BAF46De02C381Ed0F14D181f4495c1A7)
+- **Deploy tx:** [`0x9f5b036c0bb2deae5f8ad2155fc315ba181ff6cda05e53f250319522077e57f3`](https://explorer-bradbury.genlayer.com/tx/0x9f5b036c0bb2deae5f8ad2155fc315ba181ff6cda05e53f250319522077e57f3)
+- **Points at Ballpark:** `0xCbE5B73E8905062673EeD89e1C1EC9FBD2C63469` (the current deployment above)
 
 ### Live proof the cross-contract call actually works
 
 Three covenants added, two deliberately passable and one deliberately set to fail - so a clean pass wouldn't just mean "the checker rubber-stamps everything":
 
-- `min_dscr`: `dscr >= 1.25` (tx [`0xa13e0f25...`](https://explorer-bradbury.genlayer.com/tx/0xa13e0f25a405fbb1cf64e428d8e958926533a8dd80113b435d38f982df5be415))
-- `min_headcount`: `headcount >= 100` (tx [`0x98b1da15...`](https://explorer-bradbury.genlayer.com/tx/0x98b1da15fb26c3b4cfc8501be2e5a59cb548b97cf020b494b78b5c581e41ed2a))
-- `min_dscr_strict`: `dscr >= 2.0` (tx [`0x58372061...`](https://explorer-bradbury.genlayer.com/tx/0x583720610a75bd2d758ada6c28f4f5a586ba8653b2055ab757de193f3efd0c21)) - deliberately fails, since query 0's dscr is 1.4
+- `min_dscr`: `dscr >= 1.25` (tx [`0x1583c696...`](https://explorer-bradbury.genlayer.com/tx/0x1583c696a25860d0455987455c9a71a76c0a13f53f052e47341a96ff5a08ba19))
+- `min_headcount`: `headcount >= 100` (tx [`0xadb658ef...`](https://explorer-bradbury.genlayer.com/tx/0xadb658efa741783fd60fae10c3bc7f9d6254d422c81e458e4776436be1a3e309))
+- `min_dscr_strict`: `dscr >= 2.0` (tx [`0xea95bf85...`](https://explorer-bradbury.genlayer.com/tx/0xea95bf851eee7fc83a859dbb19bfb99dc3ccd273b1b557b512df79071c5e9777)) - deliberately fails, since query 0's dscr is 1.437
 
-Then `check_against_ballpark_query(0)` - tx [`0x7edbc62b...`](https://explorer-bradbury.genlayer.com/tx/0x7edbc62b4a1a00ebb2c957db346c34fac5bdf49e796229aef8f688bee8e3a95a), `FINISHED_WITH_RETURN`:
+Then `check_against_ballpark_query(0)` - tx [`0x30ffdabf...`](https://explorer-bradbury.genlayer.com/tx/0x30ffdabf99b037747b8acc1ceae976641cd9d532e4f3f87535dbf421890ec7c4), `FINISHED_WITH_RETURN`:
 
 ```json
 {
@@ -51,4 +51,8 @@ This is a real transaction where `CovenantCheck` made a real synchronous cross-c
 
 ## Superseded
 
-[`0xDaBa7fd00049a5C95C0Fd1647B85e888A20d8214`](https://explorer-bradbury.genlayer.com/address/0xDaBa7fd00049a5C95C0Fd1647B85e888A20d8214) - the version that stored the leader's raw extraction directly, correctly rejected by steward review. Left live and linked here rather than hidden, as the actual before/after for the fix described in the README.
+- [`0x2d061E63d10EcC6aeeB9f82d232fAEA9F932e6DA`](https://explorer-bradbury.genlayer.com/address/0x2d061E63d10EcC6aeeB9f82d232fAEA9F932e6DA) - Ballpark, the version that rounded to significant figures instead of enforcing a uniform tolerance, correctly rejected by a second steward review.
+- [`0xC846a4e0fcE8e8223CB06eee138161B09f2bea8A`](https://explorer-bradbury.genlayer.com/address/0xC846a4e0fcE8e8223CB06eee138161B09f2bea8A) - CovenantCheck, pointed at the address above.
+- [`0xDaBa7fd00049a5C95C0Fd1647B85e888A20d8214`](https://explorer-bradbury.genlayer.com/address/0xDaBa7fd00049a5C95C0Fd1647B85e888A20d8214) - Ballpark, the version that stored the leader's raw extraction with a 100%-tolerance ceiling, correctly rejected by the first steward review.
+
+All left live and linked here rather than hidden, as the actual before/after evidence for both fixes described in the README.
